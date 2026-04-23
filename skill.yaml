@@ -1,0 +1,170 @@
+metadata:
+  name: video-chapters
+  version: "1.0.0"
+  description: "Add YouTube/QuickTime chapter markers to an existing MP4 — no re-encode, just metadata. Chapters show up as a timeline scrubber in every modern player and video platform."
+  author: Agentino
+  tags:
+    - video
+    - metadata
+    - chapters
+    - youtube
+    - ffmpeg
+    - marketplace
+  license: MIT
+  homepage: https://github.com/agentino/agentino
+
+spec:
+  input:
+    - name: video_path
+      type: string
+      description: "Absolute path to the source video."
+      required: true
+    - name: chapters
+      type: array
+      description: "Ordered list of chapter objects, each `{title: str, start_s: float}`. The first chapter must start at 0 (or we'll auto-prepend an implicit chapter there). End time for each chapter is derived from the next chapter's start (last chapter runs to the end of the video)."
+      required: true
+    - name: output_path
+      type: string
+      description: "Destination MP4. Defaults to '<video>.chaptered.<ext>' next to the source."
+      required: false
+      default: ""
+    - name: language
+      type: string
+      description: "ISO 639-2 language tag stored with each chapter title. 'eng', 'ita', 'fra', …"
+      required: false
+      default: "eng"
+
+  output:
+    type: object
+    description: "Metadata summary: output_path, duration_s, chapter_count, chapters with per-chapter start/end seconds."
+
+  security:
+    sandbox_level: none
+    network_access: false
+    file_access: read-write
+
+  timeout_s: 180.0
+
+  executor:
+    type: python
+    code: |
+      import re
+      import shutil
+      import subprocess
+      import tempfile
+      from pathlib import Path
+
+      def _which(cmd):
+          p = shutil.which(cmd)
+          if not p:
+              raise RuntimeError(f"'{cmd}' not found on PATH. Install ffmpeg (brew/apt).")
+          return p
+
+      def _probe_duration(path):
+          ffprobe = _which("ffprobe")
+          r = subprocess.run(
+              [ffprobe, "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+              check=True, capture_output=True, text=True, timeout=30,
+          )
+          return float(r.stdout.strip())
+
+      video_path = Path(str(input.get("video_path") or "")).expanduser().resolve()
+      if not video_path.is_file():
+          raise FileNotFoundError(f"video_path not found: {video_path}")
+
+      chapters_raw = input.get("chapters") or []
+      if not isinstance(chapters_raw, list) or not chapters_raw:
+          raise ValueError("'chapters' must be a non-empty list of {title, start_s} objects.")
+
+      language = (input.get("language") or "eng").strip() or "eng"
+      if not re.fullmatch(r"[a-z]{2,3}", language):
+          raise ValueError(f"language must be a 2- or 3-letter ISO code (got '{language}').")
+
+      requested_out = (input.get("output_path") or "").strip()
+      if requested_out:
+          output_path = Path(requested_out).expanduser().resolve()
+          output_path.parent.mkdir(parents=True, exist_ok=True)
+      else:
+          stem = video_path.stem
+          ext = video_path.suffix or ".mp4"
+          output_path = video_path.with_name(f"{stem}.chaptered{ext}")
+
+      duration = _probe_duration(video_path)
+
+      # Validate + normalise chapters list.
+      chapters = []
+      for i, ch in enumerate(chapters_raw):
+          if not isinstance(ch, dict):
+              raise ValueError(f"chapters[{i}] is not an object: {ch!r}")
+          title = str(ch.get("title") or "").strip()
+          if not title:
+              raise ValueError(f"chapters[{i}] has empty title.")
+          start = float(ch.get("start_s") or 0.0)
+          if start < 0 or start >= duration:
+              raise ValueError(
+                  f"chapters[{i}] start_s={start} must be in [0, {duration:.3f})."
+              )
+          chapters.append({"title": title, "start_s": start})
+
+      chapters.sort(key=lambda c: c["start_s"])
+      for i in range(1, len(chapters)):
+          if chapters[i]["start_s"] <= chapters[i - 1]["start_s"]:
+              raise ValueError(
+                  f"chapters[{i}] start_s={chapters[i]['start_s']} must be strictly greater than "
+                  f"chapters[{i - 1}] start_s={chapters[i - 1]['start_s']}."
+              )
+
+      # Auto-prepend an implicit chapter 0 if the caller skipped it.
+      if chapters[0]["start_s"] > 0:
+          chapters.insert(0, {"title": "Intro", "start_s": 0.0})
+
+      # Derive end times.
+      for i, ch in enumerate(chapters):
+          next_start = chapters[i + 1]["start_s"] if i + 1 < len(chapters) else duration
+          ch["end_s"] = round(next_start, 3)
+          ch["start_s"] = round(ch["start_s"], 3)
+
+      # Build an ffmetadata file. Timebase is in milliseconds for safe rounding.
+      meta_lines = [";FFMETADATA1"]
+      for ch in chapters:
+          start_ms = int(round(ch["start_s"] * 1000))
+          end_ms = int(round(ch["end_s"] * 1000))
+          safe_title = ch["title"].replace("\\", "\\\\").replace("=", "\\=").replace(";", "\\;").replace("#", "\\#").replace("\n", " ")
+          meta_lines.append("[CHAPTER]")
+          meta_lines.append("TIMEBASE=1/1000")
+          meta_lines.append(f"START={start_ms}")
+          meta_lines.append(f"END={end_ms}")
+          meta_lines.append(f"title={safe_title}")
+          meta_lines.append(f"language={language}")
+
+      tmp = Path(tempfile.mkdtemp(prefix="video-chapters-"))
+      meta_file = tmp / "chapters.ffmetadata"
+      meta_file.write_text("\n".join(meta_lines), encoding="utf-8")
+
+      ffmpeg = _which("ffmpeg")
+      cmd = [
+          ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+          "-i", str(video_path),
+          "-i", str(meta_file),
+          "-map_metadata", "1",
+          "-map_chapters", "1",
+          "-c", "copy",
+          "-movflags", "+faststart",
+          str(output_path),
+      ]
+      subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
+
+      try:
+          meta_file.unlink()
+          tmp.rmdir()
+      except OSError:
+          pass
+
+      result = {
+          "output_path": str(output_path),
+          "duration_s": round(duration, 3),
+          "chapter_count": len(chapters),
+          "chapters": chapters,
+          "language": language,
+      }

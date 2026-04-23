@@ -12,7 +12,7 @@ Requires [Agentino](https://github.com/dagoSte/agentino) ≥ `1.2.0-rc.1` and `f
 brew install ffmpeg                                                    # macOS
 # sudo apt install ffmpeg                                              # Debian / Ubuntu
 
-agentino marketplace install dagoSte/agentino-skill-video-chapters
+agentino marketplace install agentino-os/agentino-skill-video-chapters
 agentino skill show video-chapters
 ```
 
